@@ -1,0 +1,113 @@
+---
+
+apiVersion: "kubeflow.org/v1"
+kind: "TFJob"
+metadata:
+  name: "llama2-7b-b-01-cn"
+spec:
+  tfReplicaSpecs:
+    Worker:
+      replicas: 1
+      restartPolicy: Never
+      template:
+        metadata:
+          annotations:
+            sidecar.istio.io/inject: "false"
+        spec:
+          volumes:
+            - name: shared-data
+              emptyDir: {}
+            - name: shm-volume
+              emptyDir:
+                medium: Memory
+          containers:
+            - name: tensorflow
+              image: registry.dekube.gdsiyu.com/dekube/env:llama2-ft-test
+              volumeMounts:
+                - name: shared-data
+                  mountPath: /mnt
+                  mountPropagation: HostToContainer
+                - name: shm-volume
+                  mountPath: /dev/shm
+              command:
+                - /bin/bash
+                - "-c"
+                - |
+                  bash << EOF
+                  sleep 1
+                  mkdir -p ${iRESULTwrk}
+                  until [ -f /mnt/dummy ]; do echo -n .; sleep 3; done
+                  dos2unix -n /mnt/s3fs/scripts/B-01/entrypoint-B-01.sh ${iRESULTwrk}/entrypoint-B-01.sh
+                  cd ${iRESULTwrk}
+                  source ./entrypoint-B-01.sh; iret=$?
+                  test "$iret" -ne 0 && { echo Error; sleep 6; }
+                  cd /
+                  rm -f /mnt/dummy
+                  exit $iret
+                  EOF
+              imagePullPolicy: Always
+              env: &env
+              - name: DEKUBE_MINIO_HOST
+                value: "https://s3-ml.dekube.gdsiyu.com:9000"
+              - name: MAX_STEPS
+                value: "20"
+              - name: iRESULTwrk
+                value: "/mnt/wrk"
+              ### To be redefined by billing system {{{
+              - name: DEKUBE_S3_ACCESS_KEY
+                value: YD9YC59PVGMBIEZPDRMU
+              - name: DEKUBE_S3_SECRET_KEY
+                value: mABMKunyPXTgZLJpo9R3mzV9uRbnC8dZ6kEXkWR
+              - name: DEKUBE_S3_BUCKET_NAME
+                value: yd9yc59pvgmbiezpdrmuc5n9q5gjeityi9yb1ct3425xhdhxi
+              - name: DEKUBE_TASK_DIGEST
+                value: "taskdigest-B-01_cn"
+              ### }}}
+              - name: DEKUBE_S3_ACCESS_KEY_READER
+                value: "dekubereader"
+              - name: DEKUBE_S3_SECRET_KEY_READER
+                value: "dekubereader"
+              - name: DEKUBE_S3_DEKUBE_BUCKET_NAME
+                value: "dekube"
+              resources:
+                limits:
+                  nvidia.com/gpu: 1
+            - name: s3mounter
+              image: registry.dekube.gdsiyu.com/dekube/tools/s3mounter
+              imagePullPolicy: Always
+              env: *env
+              volumeMounts:
+                - name: shared-data
+                  mountPath: /mnt
+                  mountPropagation: Bidirectional
+              command: 
+                - /bin/sh 
+                - "-c"
+                - |
+                  sh << EOF
+                  echo ${DEKUBE_S3_ACCESS_KEY}:${DEKUBE_S3_SECRET_KEY} > /root/.passwd-s3fs
+                  echo ${DEKUBE_S3_ACCESS_KEY_READER}:${DEKUBE_S3_SECRET_KEY_READER} > /root/.passwd-s3fs-reader
+                  chmod 600 /root/.passwd-s3fs*
+                  mkdir -p /mnt/s3fs /mnt/dekube 
+                  s3fs ${DEKUBE_S3_BUCKET_NAME} /mnt/s3fs \
+                    -o passwd_file=/root/.passwd-s3fs \
+                    -o url=${DEKUBE_MINIO_HOST} \
+                    -o use_path_request_style  ; iret1=$?  
+                  s3fs ${DEKUBE_S3_DEKUBE_BUCKET_NAME} /mnt/dekube \
+                    -o passwd_file=/root/.passwd-s3fs-reader \
+                    -o url=${DEKUBE_MINIO_HOST} \
+                    -o use_path_request_style  ; iret2=$? 
+                  touch /mnt/dummy 
+                  inotifywait -e delete /mnt/dummy 
+                  sync 
+                  mcli alias set dekube ${DEKUBE_MINIO_HOST} ${DEKUBE_S3_ACCESS_KEY} ${DEKUBE_S3_SECRET_KEY}
+                  mcli cp -r ${iRESULTwrk}/ dekube/${DEKUBE_S3_BUCKET_NAME}/results/${DEKUBE_TASK_DIGEST}/wrk/ \
+                  || mcli cp -c -r --limit-upload 512M ${iRESULTwrk}/ dekube/${DEKUBE_S3_BUCKET_NAME}/results/${DEKUBE_TASK_DIGEST}/wrk/
+                  while mount | grep -q -e /mnt/s3fs -e /mnt/dekube ; do echo Detect mount ; umount /mnt/s3fs /mnt/dekube ; umount -l /mnt/s3fs /mnt/dekube &>/dev/null ; sleep 1 ; done 
+                  exit $((iret1+iret2)) 
+                  EOF
+              securityContext:
+                privileged: true
+                capabilities:
+                  add:
+                    - SYS_ADMIN
